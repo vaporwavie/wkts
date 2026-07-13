@@ -18,14 +18,47 @@ mkdir -p "$CACHE_DIR"
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/wkts.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 
+# ── Ghost sweep ──────────────────────────────────────────────────────────────
+# A worktree deleted without `git worktree remove` leaves metadata in
+# <main>/.git/worktrees/<name> that keeps its branch un-checkout-able
+# ("already checked out in another worktree"). `git worktree prune` skips
+# *locked* entries — and Claude Code locks its .claude/worktrees — so a
+# hard-killed session leaves a permanent ghost. Unlock entries whose directory
+# is gone (unless the lock-holder pid is still alive), then prune.
+sweep_ghosts() {
+  main_git=$1
+  swept=0
+  for admin in "$main_git"/worktrees/*/; do
+    [ -e "${admin%/}" ] || continue
+    wt_gitfile=$(head -1 "${admin}gitdir" 2>/dev/null)
+    [ -n "$wt_gitfile" ] && [ -e "$wt_gitfile" ] && continue
+    if [ -f "${admin}locked" ]; then
+      pid=$(grep -oE 'pid [0-9]+' "${admin}locked" 2>/dev/null | head -1 | cut -d' ' -f2)
+      [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && continue
+      rm -f "${admin}locked"
+    fi
+    swept=1
+  done
+  if [ "$swept" = 1 ]; then
+    git --git-dir="$main_git" worktree prune 2>/dev/null
+    echo "  ⌫ pruned ghost worktree(s) in ${main_git%/.git}" >&2
+  fi
+}
+
 # ── Phase 1: fast discovery ──────────────────────────────────────────────────
 echo "Scanning $SEARCH_ROOT for worktrees..." >&2
 
 find "$SEARCH_ROOT" -maxdepth "$MAX_DEPTH" \
   \( -name Library -o -name node_modules -o -name .Trash -o -name .cache \
      -o -name .npm -o -name .cargo -o -name .nvm -o -name .asdf \) -prune \
+  -o -name .git -type d -print -prune \
   -o -name .git -type f -print 2>/dev/null |
 while IFS= read -r gitfile; do
+  # Main-repo .git dirs: sweep stale worktree metadata, they're not candidates
+  if [ -d "$gitfile" ]; then
+    [ -d "$gitfile/worktrees" ] && sweep_ghosts "$gitfile"
+    continue
+  fi
   wt_dir=${gitfile%/.git}
   IFS=' ' read -r tag gitdir < "$gitfile" || continue
   [ "$tag" = 'gitdir:' ] || continue
@@ -148,6 +181,8 @@ printf '%s\n' "$selected" | {
   while IFS=$'\t' read -r _display wt_path main_git size_kb; do
     [ -n "$wt_path" ] || continue
     ok=0
+    # Claude Code locks its worktrees; remove/prune both refuse locked entries
+    git --git-dir="$main_git" worktree unlock "$wt_path" 2>/dev/null
     if git --git-dir="$main_git" worktree remove --force "$wt_path" 2>/dev/null; then
       echo "Removed: $wt_path"; ok=1
     else
