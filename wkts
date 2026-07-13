@@ -1,0 +1,169 @@
+#!/bin/bash
+# wkts — list git worktrees on this machine, multi-select with space, delete on enter.
+# Requires: fzf. Discovery: linked worktrees are directories whose .git is a *file*
+# pointing at <main-repo>/.git/worktrees/<name>.
+
+set -u
+
+command -v fzf >/dev/null 2>&1 || { echo "wkts: fzf is required (brew install fzf)" >&2; exit 1; }
+
+SEARCH_ROOT="${WKTS_ROOT:-$HOME}"
+MAX_DEPTH="${WKTS_DEPTH:-7}"
+JOBS="${WKTS_JOBS:-4}"
+
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/wkts"
+SIZE_CACHE="$CACHE_DIR/sizes.tsv"     # <wt_dir>\t<size_kb>
+mkdir -p "$CACHE_DIR"
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/wkts.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+
+# ── Phase 1: fast discovery ──────────────────────────────────────────────────
+echo "Scanning $SEARCH_ROOT for worktrees..." >&2
+
+find "$SEARCH_ROOT" -maxdepth "$MAX_DEPTH" \
+  \( -name Library -o -name node_modules -o -name .Trash -o -name .cache \
+     -o -name .npm -o -name .cargo -o -name .nvm -o -name .asdf \) -prune \
+  -o -name .git -type f -print 2>/dev/null |
+while IFS= read -r gitfile; do
+  wt_dir=${gitfile%/.git}
+  IFS=' ' read -r tag gitdir < "$gitfile" || continue
+  [ "$tag" = 'gitdir:' ] || continue
+  case "$gitdir" in
+    */.git/worktrees/*) ;;
+    *) continue ;;
+  esac
+  main_git="${gitdir%/worktrees/*}"                 # .../<repo>/.git
+  main_repo="${main_git%/.git}"
+  project=${main_repo##*/}
+  name=${wt_dir##*/}
+  printf '%s\t%s\t%s\t%s\t%s\n' "$wt_dir" "$main_git" "$name" "$project" "$gitdir"
+done > "$tmp/candidates"
+
+total=$(grep -c . "$tmp/candidates" 2>/dev/null || true)
+if [ "${total:-0}" -eq 0 ]; then
+  echo "No linked git worktrees found under $SEARCH_ROOT" >&2
+  exit 0
+fi
+echo "Found $total worktrees, measuring size and last activity..." >&2
+
+# ── Phase 2: parallel per-worktree scan, streaming results as they finish ───
+scan_one() {
+  wt_dir=$1 main_git=$2 name=$3 project=$4 gitdir=$5
+
+  # Size: cached from a previous run when available (du on big trees takes
+  # seconds); a detached background job refreshes the cache during the picker.
+  approx=''
+  size_kb=$(awk -F'\t' -v p="$wt_dir" '$1==p{print $2; exit}' "$SIZE_CACHE" 2>/dev/null)
+  if [ -n "$size_kb" ]; then
+    approx='~'
+  else
+    size_kb=$(du -sk "$wt_dir" 2>/dev/null | cut -f1)
+    size_kb=${size_kb:-0}
+  fi
+  size_h=$approx$(awk -v k="$size_kb" 'BEGIN{
+    if (k>=1048576) printf "%.1fG", k/1048576;
+    else if (k>=1024) printf "%.0fM", k/1024;
+    else printf "%dK", k }')
+
+  # Last activity: git metadata mtime (index/HEAD are touched by any git
+  # interaction) — O(1). WKTS_DEEP=1 scans every file's mtime instead (slow).
+  if [ "${WKTS_DEEP:-0}" = "1" ]; then
+    last=$(find "$wt_dir" \( -name node_modules -o -name .git \) -prune \
+             -o -type f -print0 2>/dev/null |
+           xargs -0 stat -f '%m' 2>/dev/null | sort -rn | head -1)
+  else
+    last=$(stat -f '%m' "$gitdir/index" "$gitdir/HEAD" "$wt_dir" 2>/dev/null |
+           sort -rn | head -1)
+  fi
+  last=${last:-$(stat -f '%m' "$wt_dir" 2>/dev/null || echo 0)}
+  last_h=$(date -r "$last" '+%Y-%m-%d' 2>/dev/null || echo '?')
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$size_kb" "$size_h" "$last" "$last_h" "$name" "$project" "$wt_dir" "$main_git" >> "$tmp/rows"
+  printf '  ✓ %-24s %-16s %7s  last active %s\n' "$name" "$project" "$size_h" "$last_h" >&2
+}
+
+i=0
+while IFS=$'\t' read -r wt_dir main_git name project gitdir; do
+  [ -n "$wt_dir" ] || continue
+  scan_one "$wt_dir" "$main_git" "$name" "$project" "$gitdir" &
+  i=$((i + 1))
+  # Safety valve: only throttle on unusually large fleets
+  [ $((i % JOBS)) -eq 0 ] && [ "$i" -ge "$JOBS" ] && [ "$total" -gt 32 ] && wait
+done < "$tmp/candidates"
+wait
+
+# Refresh the size cache in the background (detached) so the next run is
+# instant with at-most-one-run-old sizes. Skip if a refresher is still going.
+refresh_lock="$CACHE_DIR/refresh.pid"
+if ! kill -0 "$(cat "$refresh_lock" 2>/dev/null)" 2>/dev/null; then
+  cp "$tmp/candidates" "$CACHE_DIR/.refresh-list"
+  (
+    while IFS=$'\t' read -r wt_dir _rest; do
+      kb=$(du -sk "$wt_dir" 2>/dev/null | cut -f1)
+      [ -n "$kb" ] && printf '%s\t%s\n' "$wt_dir" "$kb"
+    done < "$CACHE_DIR/.refresh-list" > "$SIZE_CACHE.new"
+    mv -f "$SIZE_CACHE.new" "$SIZE_CACHE"
+    rm -f "$refresh_lock" "$CACHE_DIR/.refresh-list"
+  ) >/dev/null 2>&1 &
+  echo $! > "$refresh_lock"
+fi
+
+# ── Phase 3: sort by size (desc) and pick ────────────────────────────────────
+header=$(printf '%-24s %-16s %7s  %-11s  %s' 'NAME' 'PROJECT' 'SIZE' 'LAST ACTIVE' 'LOCATION')
+
+selected=$(sort -t$'\t' -k1,1rn "$tmp/rows" |
+  while IFS=$'\t' read -r kb size_h _epoch last_h name project wt_dir main_git; do
+    display=$(printf '%-24s %-16s %7s  %-11s  %s' "$name" "$project" "$size_h" "$last_h" "$wt_dir")
+    printf '%s\t%s\t%s\t%s\n' "$display" "$wt_dir" "$main_git" "$kb"
+  done | fzf \
+  --multi \
+  --delimiter=$'\t' \
+  --with-nth=1 \
+  --no-sort \
+  --bind 'space:toggle+down' \
+  --marker='✓ ' \
+  --header="$header"$'\n''[space] select   [enter] delete selected   [esc] quit' \
+  --preview 'git -C {2} log --oneline -5 2>/dev/null; echo; git -C {2} status --short 2>/dev/null | head -20' \
+  --preview-window 'down,30%,border-top' \
+  --height='80%' --layout=reverse --border)
+
+[ -n "$selected" ] || exit 0
+
+count=$(printf '%s\n' "$selected" | grep -c .)
+echo
+echo "Selected for deletion:"
+printf '%s\n' "$selected" | cut -f2 | sed 's/^/  /'
+echo
+printf 'Delete %s worktree(s)? This removes the directory. [y/N] ' "$count"
+read -r answer
+case "$answer" in
+  y|Y|yes|YES) ;;
+  *) echo "Aborted."; exit 0 ;;
+esac
+
+printf '%s\n' "$selected" | {
+  total_kb=0 removed=0
+  while IFS=$'\t' read -r _display wt_path main_git size_kb; do
+    [ -n "$wt_path" ] || continue
+    ok=0
+    if git --git-dir="$main_git" worktree remove --force "$wt_path" 2>/dev/null; then
+      echo "Removed: $wt_path"; ok=1
+    else
+      # Fallback: main repo may be gone or metadata stale — delete dir and prune
+      rm -rf "$wt_path" && { echo "Removed (rm): $wt_path"; ok=1; }
+      git --git-dir="$main_git" worktree prune 2>/dev/null
+    fi
+    if [ "$ok" = 1 ]; then
+      removed=$((removed + 1))
+      total_kb=$((total_kb + ${size_kb:-0}))
+    fi
+  done
+  total_h=$(awk -v k="$total_kb" 'BEGIN{
+    if (k>=1048576) printf "%.1fGB", k/1048576;
+    else if (k>=1024) printf "%.0fMB", k/1024;
+    else printf "%dKB", k }')
+  echo
+  echo "✨ Done: $removed worktree(s), total removed $total_h"
+}
